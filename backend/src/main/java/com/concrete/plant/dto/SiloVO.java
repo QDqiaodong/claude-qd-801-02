@@ -19,8 +19,12 @@ public class SiloVO {
     private String materialName;
     private BigDecimal capacityTon;
     private BigDecimal stockTon;
+    /** 待审批补料申请占用仓容合计 吨 */
+    private BigDecimal pendingOccupiedTon;
+    /** 可申请余量 = 仓容 - 当前库存 - 待审批占用 吨 */
+    private BigDecimal availableTon;
     private BigDecimal safetyStockTon;
-    /** 液位百分比 */
+    /** 液位百分比（仅按当前库存，不含待审批占用） */
     private BigDecimal fillPercent;
     /** 低于安全库存 */
     private boolean lowStock;

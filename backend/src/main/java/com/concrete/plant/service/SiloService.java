@@ -25,6 +25,10 @@ import com.concrete.plant.repository.SiloRepository;
 
 /**
  * 原材料筒仓：液位、安全库存告警、补料申请与审批。
+ *
+ * 仓容口径：可申请余量 = 仓容 - 当前库存 - 其他待审批申请占用量。
+ * 发起申请时按此口径统一拦截；审批通过时在筒仓行锁内重新核对（排除本单自身），
+ * 校验失败只抛异常，库存与申请状态均不变；驳回后申请不再是 PENDING，占用即时释放。
  */
 @Service
 public class SiloService {
@@ -65,6 +69,9 @@ public class SiloService {
         vo.setCapacityTon(nz(silo.getCapacityTon()));
         vo.setStockTon(nz(silo.getStockTon()));
         vo.setSafetyStockTon(nz(silo.getSafetyStockTon()));
+        BigDecimal pending = pendingOccupied(silo.getId());
+        vo.setPendingOccupiedTon(pending);
+        vo.setAvailableTon(availableTon(silo, pending));
         if (vo.getCapacityTon().compareTo(BigDecimal.ZERO) > 0) {
             vo.setFillPercent(vo.getStockTon().multiply(BigDecimal.valueOf(100))
                     .divide(vo.getCapacityTon(), 1, RoundingMode.HALF_UP));
@@ -77,11 +84,12 @@ public class SiloService {
     }
 
     /**
-     * 发起补料申请。
+     * 发起补料申请：按「当前库存 + 全部待审批占用」统一计算可申请余量，超出立即拒绝。
+     * 先锁筒仓、再锁定该仓全部待审批申请，连续并发提交也只会按同一口径串行放行。
      */
     @Transactional
     public ReplenishVO apply(ReplenishCommand command) {
-        Silo silo = siloRepository.findById(command.getSiloId())
+        Silo silo = siloRepository.findByIdForUpdate(command.getSiloId())
                 .orElseThrow(() -> new BizException("筒仓不存在：id=" + command.getSiloId()));
         BigDecimal quantity = command.getQuantityTon();
         if (quantity == null || quantity.compareTo(BigDecimal.ZERO) <= 0) {
@@ -90,13 +98,16 @@ public class SiloService {
         if (quantity.compareTo(Dict.MAX_REPLENISH_TON) > 0) {
             throw new BizException("单次补料不得超过 " + Dict.MAX_REPLENISH_TON + " 吨");
         }
+        BigDecimal pending = lockedPendingTotal(silo.getId(), null);
+        BigDecimal available = availableTon(silo, pending);
+        if (quantity.compareTo(available) > 0) {
+            BigDecimal gap = quantity.subtract(available);
+            throw new BizException(silo.getName() + "可申请余量仅剩 " + available + " 吨，本次申请 " + quantity
+                    + " 吨，超出 " + gap + " 吨（当前库存 " + nz(silo.getStockTon()) + " 吨、其他待审批已占用 "
+                    + pending + " 吨、仓容 " + nz(silo.getCapacityTon()) + " 吨）");
+        }
         String applicant = command.getApplicant() == null || command.getApplicant().isBlank()
                 ? "调度中心" : command.getApplicant().trim();
-        BigDecimal after = nz(silo.getStockTon()).add(quantity);
-        if (after.compareTo(nz(silo.getCapacityTon())) > 0) {
-            throw new BizException("补料后库存 " + after + " 吨将超过 " + silo.getName() + " 仓容 "
-                    + silo.getCapacityTon() + " 吨");
-        }
         ReplenishRequest request = new ReplenishRequest();
         request.setRequestNo(nextRequestNo());
         request.setSilo(silo);
@@ -118,21 +129,30 @@ public class SiloService {
     }
 
     /**
-     * 审批通过：回补筒仓库存。
+     * 审批通过：先锁筒仓、再锁申请，行锁内按最新数据重新核对仓容，
+     * 待审批占用排除本单自身。任一校验失败只抛异常，库存不回补、申请仍为待审批。
      */
     @Transactional
     public ReplenishVO approve(Long id, String decidedBy) {
-        ReplenishRequest request = getRequest(id);
+        Long siloId = replenishRepository.findSiloIdById(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
+        Silo silo = siloRepository.findByIdForUpdate(siloId)
+                .orElseThrow(() -> new BizException("筒仓不存在：id=" + siloId));
+        ReplenishRequest request = replenishRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
         if (!"PENDING".equals(request.getStatus())) {
             throw new BizException("该申请已「" + Dict.replenishStatusName(request.getStatus()) + "」，不可重复审批");
         }
-        Silo silo = request.getSilo();
-        BigDecimal after = nz(silo.getStockTon()).add(nz(request.getQuantityTon()));
-        if (after.compareTo(nz(silo.getCapacityTon())) > 0) {
-            throw new BizException("补料后库存 " + after + " 吨将超过 " + silo.getName() + " 仓容 "
-                    + silo.getCapacityTon() + " 吨，请先消耗或改小补料量");
+        BigDecimal quantity = nz(request.getQuantityTon());
+        BigDecimal otherPending = lockedPendingTotal(silo.getId(), id);
+        BigDecimal available = availableTon(silo, otherPending);
+        if (quantity.compareTo(available) > 0) {
+            BigDecimal gap = quantity.subtract(available);
+            throw new BizException("审批未通过：" + silo.getName() + "当前库存 " + nz(silo.getStockTon())
+                    + " 吨、其他待审批占用 " + otherPending + " 吨，排除本单后可申请余量仅剩 " + available
+                    + " 吨，本单 " + quantity + " 吨将超仓容 " + gap + " 吨，请先消耗库存或改小补料量");
         }
-        silo.setStockTon(after);
+        silo.setStockTon(nz(silo.getStockTon()).add(quantity));
         siloRepository.save(silo);
         request.setStatus("APPROVED");
         request.setDecidedAt(LocalDateTime.now());
@@ -140,9 +160,18 @@ public class SiloService {
         return toVO(replenishRepository.save(request));
     }
 
+    /**
+     * 驳回：同样先锁筒仓、再锁申请；申请退出 PENDING，
+     * 其占用的可申请余量在本事务提交后即时释放（口径只统计 PENDING）。
+     */
     @Transactional
     public ReplenishVO reject(Long id, String decidedBy, String remark) {
-        ReplenishRequest request = getRequest(id);
+        Long siloId = replenishRepository.findSiloIdById(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
+        siloRepository.findByIdForUpdate(siloId)
+                .orElseThrow(() -> new BizException("筒仓不存在：id=" + siloId));
+        ReplenishRequest request = replenishRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
         if (!"PENDING".equals(request.getStatus())) {
             throw new BizException("该申请已「" + Dict.replenishStatusName(request.getStatus()) + "」，不可重复审批");
         }
@@ -226,8 +255,30 @@ public class SiloService {
         return need;
     }
 
-    private ReplenishRequest getRequest(Long id) {
-        return replenishRepository.findById(id).orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
+    /** 列表展示口径：某筒仓待审批占用合计（只读，不加锁） */
+    private BigDecimal pendingOccupied(Long siloId) {
+        return nz(replenishRepository.sumPendingQuantity(siloId, null));
+    }
+
+    /**
+     * 写事务口径：已持有筒仓行锁后，锁定该仓全部待审批申请并实时汇总。
+     *
+     * @param excludeId 审批重新核对时排除本单自身；发起申请传 null
+     */
+    private BigDecimal lockedPendingTotal(Long siloId, Long excludeId) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (ReplenishRequest r : replenishRepository.findPendingBySiloForUpdate(siloId)) {
+            if (excludeId == null || !excludeId.equals(r.getId())) {
+                total = total.add(nz(r.getQuantityTon()));
+            }
+        }
+        return total;
+    }
+
+    /** 可申请余量 = 仓容 - 当前库存 - 待审批占用，不小于 0 */
+    private BigDecimal availableTon(Silo silo, BigDecimal pending) {
+        BigDecimal available = nz(silo.getCapacityTon()).subtract(nz(silo.getStockTon())).subtract(nz(pending));
+        return available.max(BigDecimal.ZERO);
     }
 
     private String nextRequestNo() {
