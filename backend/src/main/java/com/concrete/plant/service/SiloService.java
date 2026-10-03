@@ -5,6 +5,7 @@ import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,40 +40,54 @@ public class SiloService {
 
     @Transactional(readOnly = true)
     public List<SiloVO> list() {
-        List<SiloVO> vos = new ArrayList<>();
-        for (Silo silo : siloRepository.findAllOrdered()) {
-            vos.add(toVO(silo));
-        }
-        return vos;
+        return toSiloVOs(siloRepository.findAllOrdered());
     }
 
     @Transactional(readOnly = true)
     public List<SiloVO> lowStock() {
+        return toSiloVOs(siloRepository.findLowStock());
+    }
+
+    private List<SiloVO> toSiloVOs(List<Silo> silos) {
+        Map<Long, BigDecimal> pendingMap = pendingOccupancyMap();
         List<SiloVO> vos = new ArrayList<>();
-        for (Silo silo : siloRepository.findLowStock()) {
-            vos.add(toVO(silo));
+        for (Silo silo : silos) {
+            vos.add(toVO(silo, pendingMap.getOrDefault(silo.getId(), BigDecimal.ZERO)));
         }
         return vos;
     }
 
-    private SiloVO toVO(Silo silo) {
+    private Map<Long, BigDecimal> pendingOccupancyMap() {
+        Map<Long, BigDecimal> pendingMap = new HashMap<>();
+        for (ReplenishRequestRepository.PendingOccupancy occupancy : replenishRepository.sumPendingBySilo()) {
+            pendingMap.put(occupancy.getSiloId(), nz(occupancy.getPendingTon()));
+        }
+        return pendingMap;
+    }
+
+    private SiloVO toVO(Silo silo, BigDecimal pendingOccupancyTon) {
+        BigDecimal pending = nz(pendingOccupancyTon);
+        BigDecimal stock = nz(silo.getStockTon());
+        BigDecimal capacity = nz(silo.getCapacityTon());
         SiloVO vo = new SiloVO();
         vo.setId(silo.getId());
         vo.setSiloCode(silo.getSiloCode());
         vo.setName(silo.getName());
         vo.setMaterialCode(silo.getMaterialCode());
         vo.setMaterialName(Dict.siloMaterialName(silo.getMaterialCode()));
-        vo.setCapacityTon(nz(silo.getCapacityTon()));
-        vo.setStockTon(nz(silo.getStockTon()));
+        vo.setCapacityTon(capacity);
+        vo.setStockTon(stock);
+        vo.setPendingOccupancyTon(pending);
+        vo.setAvailableTon(capacity.subtract(stock).subtract(pending));
         vo.setSafetyStockTon(nz(silo.getSafetyStockTon()));
-        if (vo.getCapacityTon().compareTo(BigDecimal.ZERO) > 0) {
-            vo.setFillPercent(vo.getStockTon().multiply(BigDecimal.valueOf(100))
-                    .divide(vo.getCapacityTon(), 1, RoundingMode.HALF_UP));
+        if (capacity.compareTo(BigDecimal.ZERO) > 0) {
+            vo.setFillPercent(stock.multiply(BigDecimal.valueOf(100))
+                    .divide(capacity, 1, RoundingMode.HALF_UP));
         } else {
             vo.setFillPercent(BigDecimal.ZERO);
         }
-        vo.setLowStock(vo.getStockTon().compareTo(vo.getSafetyStockTon()) < 0);
-        vo.setGapTon(vo.isLowStock() ? vo.getSafetyStockTon().subtract(vo.getStockTon()) : BigDecimal.ZERO);
+        vo.setLowStock(stock.compareTo(vo.getSafetyStockTon()) < 0);
+        vo.setGapTon(vo.isLowStock() ? vo.getSafetyStockTon().subtract(stock) : BigDecimal.ZERO);
         return vo;
     }
 
@@ -81,7 +96,7 @@ public class SiloService {
      */
     @Transactional
     public ReplenishVO apply(ReplenishCommand command) {
-        Silo silo = siloRepository.findById(command.getSiloId())
+        Silo silo = siloRepository.findByIdForUpdate(command.getSiloId())
                 .orElseThrow(() -> new BizException("筒仓不存在：id=" + command.getSiloId()));
         BigDecimal quantity = command.getQuantityTon();
         if (quantity == null || quantity.compareTo(BigDecimal.ZERO) <= 0) {
@@ -92,10 +107,16 @@ public class SiloService {
         }
         String applicant = command.getApplicant() == null || command.getApplicant().isBlank()
                 ? "调度中心" : command.getApplicant().trim();
-        BigDecimal after = nz(silo.getStockTon()).add(quantity);
-        if (after.compareTo(nz(silo.getCapacityTon())) > 0) {
-            throw new BizException("补料后库存 " + after + " 吨将超过 " + silo.getName() + " 仓容 "
-                    + silo.getCapacityTon() + " 吨");
+        BigDecimal stock = nz(silo.getStockTon());
+        BigDecimal capacity = nz(silo.getCapacityTon());
+        // 申请口径包含全部待审批申请；当前事务尚未插入本单，因此这里就是“其他待审批量”。
+        BigDecimal otherPending = replenishRepository.sumPendingBySiloId(silo.getId());
+        BigDecimal available = capacity.subtract(stock).subtract(otherPending);
+        if (quantity.compareTo(available) > 0) {
+            BigDecimal gap = quantity.subtract(available);
+            throw new BizException(silo.getName() + "可申请余量不足：当前库存 " + stock + " 吨、待审批占用 "
+                    + otherPending + " 吨、仓容 " + capacity + " 吨，余量 " + available + " 吨；本次申请 "
+                    + quantity + " 吨，超出余量 " + gap + " 吨，请改小补料量");
         }
         ReplenishRequest request = new ReplenishRequest();
         request.setRequestNo(nextRequestNo());
@@ -122,18 +143,30 @@ public class SiloService {
      */
     @Transactional
     public ReplenishVO approve(Long id, String decidedBy) {
-        ReplenishRequest request = getRequest(id);
+        Long siloId = replenishRepository.findSiloIdById(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
+        Silo silo = siloRepository.findByIdForUpdate(siloId)
+                .orElseThrow(() -> new BizException("筒仓不存在：id=" + siloId));
+        ReplenishRequest request = replenishRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
         if (!"PENDING".equals(request.getStatus())) {
             throw new BizException("该申请已「" + Dict.replenishStatusName(request.getStatus()) + "」，不可重复审批");
         }
-        Silo silo = request.getSilo();
-        BigDecimal after = nz(silo.getStockTon()).add(nz(request.getQuantityTon()));
-        if (after.compareTo(nz(silo.getCapacityTon())) > 0) {
-            throw new BizException("补料后库存 " + after + " 吨将超过 " + silo.getName() + " 仓容 "
-                    + silo.getCapacityTon() + " 吨，请先消耗或改小补料量");
+
+        BigDecimal quantity = nz(request.getQuantityTon());
+        BigDecimal stock = nz(silo.getStockTon());
+        BigDecimal capacity = nz(silo.getCapacityTon());
+        // 审批口径排除本单自身：本单通过后不再占用余量，而是把本单数量实际计入当前库存。
+        BigDecimal otherPending = replenishRepository.sumPendingBySiloIdExcluding(silo.getId(), request.getId());
+        BigDecimal available = capacity.subtract(stock).subtract(otherPending);
+        if (quantity.compareTo(available) > 0) {
+            BigDecimal gap = quantity.subtract(available);
+            throw new BizException("审批复核未通过：" + silo.getName() + "当前库存 " + stock + " 吨、其他待审批占用 "
+                    + otherPending + " 吨、仓容 " + capacity + " 吨，本单审批后将超出仓容，缺口 " + gap
+                    + " 吨；申请保持待审批，库存未变动");
         }
-        silo.setStockTon(after);
-        siloRepository.save(silo);
+
+        silo.setStockTon(stock.add(quantity));
         request.setStatus("APPROVED");
         request.setDecidedAt(LocalDateTime.now());
         request.setDecidedBy(decidedBy == null || decidedBy.isBlank() ? "调度主管" : decidedBy.trim());
@@ -142,7 +175,12 @@ public class SiloService {
 
     @Transactional
     public ReplenishVO reject(Long id, String decidedBy, String remark) {
-        ReplenishRequest request = getRequest(id);
+        Long siloId = replenishRepository.findSiloIdById(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
+        Silo silo = siloRepository.findByIdForUpdate(siloId)
+                .orElseThrow(() -> new BizException("筒仓不存在：id=" + siloId));
+        ReplenishRequest request = replenishRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
         if (!"PENDING".equals(request.getStatus())) {
             throw new BizException("该申请已「" + Dict.replenishStatusName(request.getStatus()) + "」，不可重复审批");
         }
@@ -181,8 +219,7 @@ public class SiloService {
         List<String> shortages = new ArrayList<>();
         for (Map.Entry<String, BigDecimal> need : materialNeed(order, volume).entrySet()) {
             BigDecimal remain = need.getValue();
-            List<Silo> silos = siloRepository.findAllOrdered().stream()
-                    .filter(s -> need.getKey().equals(s.getMaterialCode()))
+            List<Silo> silos = siloRepository.findMaterialForUpdate(need.getKey()).stream()
                     .sorted(Comparator.comparing(Silo::getId))
                     .toList();
             BigDecimal total = BigDecimal.ZERO;
@@ -224,10 +261,6 @@ public class SiloService {
             need.merge(item.getMaterialCode(), ton, BigDecimal::add);
         }
         return need;
-    }
-
-    private ReplenishRequest getRequest(Long id) {
-        return replenishRepository.findById(id).orElseThrow(() -> new BizException("补料申请不存在：id=" + id));
     }
 
     private String nextRequestNo() {

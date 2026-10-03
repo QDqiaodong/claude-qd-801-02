@@ -33,10 +33,21 @@
             </div>
             <div class="sv-name">{{ s.name }}</div>
             <div class="sv-meta">{{ s.materialName }} · 仓容 {{ s.capacityTon }}t</div>
-            <div class="sv-stock" :class="{ low: s.lowStock }">
-              {{ s.stockTon }} t
-              <span v-if="s.lowStock" class="sv-gap">缺 {{ s.gapTon }}t</span>
+            <div class="sv-stats">
+              <div>
+                <span>当前库存</span>
+                <b>{{ s.stockTon }}t</b>
+              </div>
+              <div>
+                <span>待审批占用</span>
+                <b class="pending">{{ s.pendingOccupancyTon }}t</b>
+              </div>
+              <div>
+                <span>可申请余量</span>
+                <b :class="{ short: num(s.availableTon) <= 0 }">{{ s.availableTon }}t</b>
+              </div>
             </div>
+            <div v-if="s.lowStock" class="sv-gap">低于安全库存 {{ s.gapTon }}t</div>
             <el-button size="small" type="primary" plain @click="openApply(s)">补料</el-button>
           </div>
         </div>
@@ -110,12 +121,34 @@
     <el-dialog v-model="dialog" title="发起补料申请" width="400px">
       <div v-if="cur.id" class="sv-info">
         <div><span class="cp-muted">筒仓</span> {{ cur.name }}（{{ cur.materialName }}）</div>
-        <div><span class="cp-muted">当前库存</span> {{ cur.stockTon }} t / 仓容 {{ cur.capacityTon }} t</div>
+        <div><span class="cp-muted">仓容</span> {{ cur.capacityTon }} t</div>
+        <div class="sv-quota">
+          <span><i>当前库存</i><b>{{ cur.stockTon }} t</b></span>
+          <span><i>待审批占用</i><b>{{ cur.pendingOccupancyTon }} t</b></span>
+          <span><i>可申请余量</i><b :class="{ short: curAvailable <= 0 }">{{ curAvailable }} t</b></span>
+        </div>
         <div><span class="cp-muted">安全库存</span> {{ cur.safetyStockTon }} t</div>
+        <el-alert
+          v-if="curAvailable <= 0"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="当前没有可申请余量，请先处理待审批申请或等待库存消耗"
+          style="margin-top: 8px"
+        />
       </div>
       <el-form label-width="86px" size="small" style="margin-top: 12px">
         <el-form-item label="补料量(吨)">
-          <el-input-number v-model="applyForm.quantityTon" :min="1" :max="200" :step="5" />
+          <el-input-number
+            v-model="applyForm.quantityTon"
+            :min="curAvailable > 0 ? 0.01 : 0"
+            :max="applyMax"
+            :step="5"
+            :precision="2"
+          />
+          <div class="sv-form-hint" :class="{ short: applyGap > 0 }">
+            {{ applyGap > 0 ? `超出可申请余量 ${applyGap} 吨` : `最多可申请 ${applyMax} 吨` }}
+          </div>
         </el-form-item>
         <el-form-item label="申请人">
           <el-input v-model="applyForm.applicant" style="width: 180px" />
@@ -126,7 +159,7 @@
       </el-form>
       <div style="text-align: right">
         <el-button size="small" @click="dialog = false">取消</el-button>
-        <el-button size="small" type="primary" @click="submitApply">提交申请</el-button>
+        <el-button size="small" type="primary" :disabled="!canApply" @click="submitApply">提交申请</el-button>
       </div>
     </el-dialog>
   </div>
@@ -145,6 +178,16 @@ const cur = ref({})
 const applyForm = ref({ quantityTon: 50, applicant: '调度中心', remark: '' })
 
 const pending = computed(() => requests.value.filter((r) => r.status === 'PENDING'))
+const curAvailable = computed(() => num(cur.value.availableTon))
+const applyMax = computed(() => Math.min(Math.max(curAvailable.value, 0), 200))
+const applyGap = computed(() => {
+  const quantity = num(applyForm.value.quantityTon)
+  return Number(Math.max(quantity - curAvailable.value, 0).toFixed(2))
+})
+const canApply = computed(() => {
+  const quantity = num(applyForm.value.quantityTon)
+  return quantity > 0 && quantity <= curAvailable.value && quantity <= 200
+})
 
 const MATERIAL_COLOR = {
   CEMENT: 'linear-gradient(180deg,#7e918d,#4d5f5c)',
@@ -152,6 +195,10 @@ const MATERIAL_COLOR = {
   SLAG: 'linear-gradient(180deg,#6f9aa6,#3f6b76)',
   SAND: 'linear-gradient(180deg,#dcbb52,#a8871a)',
   STONE: 'linear-gradient(180deg,#8b9994,#57645f)'
+}
+
+function num(value) {
+  return Number(value || 0)
 }
 
 function fillColor(code) {
@@ -189,6 +236,9 @@ async function load() {
     silos.value = sl.data || []
     requests.value = rq.data || []
     sites.value = st.data || []
+    if (cur.value.id) {
+      cur.value = silos.value.find((s) => s.id === cur.value.id) || {}
+    }
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -196,7 +246,8 @@ async function load() {
 
 function openApply(silo) {
   cur.value = silo
-  applyForm.value = { quantityTon: 50, applicant: '调度中心', remark: '' }
+  const defaultQuantity = Math.min(Math.max(num(silo.availableTon), 0), 50)
+  applyForm.value = { quantityTon: defaultQuantity, applicant: '调度中心', remark: '' }
   dialog.value = true
 }
 
@@ -205,9 +256,11 @@ async function submitApply() {
     await api.applyReplenish({ siloId: cur.value.id, ...applyForm.value })
     ElMessage.success('补料申请已提交，等待审批')
     dialog.value = false
-    await load()
+    cur.value = {}
   } catch (e) {
     ElMessage.error(e.message)
+  } finally {
+    await load()
   }
 }
 
@@ -215,19 +268,21 @@ async function approve(row) {
   try {
     await api.approveReplenish(row.id, '调度主管 周炯')
     ElMessage.success('已通过，筒仓库存已回补')
-    await load()
   } catch (e) {
     ElMessage.error(e.message)
+  } finally {
+    await load()
   }
 }
 
 async function reject(row) {
   try {
     await api.rejectReplenish(row.id, '调度主管 周炯', '暂缓采购')
-    ElMessage.success('已驳回')
-    await load()
+    ElMessage.success('已驳回，待审批占用已释放')
   } catch (e) {
     ElMessage.error(e.message)
+  } finally {
+    await load()
   }
 }
 
@@ -360,23 +415,45 @@ onMounted(load)
   margin-bottom: 2px;
 }
 
-.sv-stock {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--cp-primary);
-  margin-bottom: 6px;
+.sv-stats {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px;
+  margin: 4px 0 6px;
+  font-size: 10px;
+  color: var(--cp-muted);
   font-variant-numeric: tabular-nums;
 }
 
-.sv-stock.low {
+.sv-stats div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.sv-stats b {
+  font-size: 12px;
+  color: var(--cp-primary);
+}
+
+.sv-stats b.pending {
+  color: var(--cp-warn);
+}
+
+.sv-stats b.low {
+  color: var(--cp-danger);
+}
+
+.sv-stats b.short {
   color: var(--cp-danger);
 }
 
 .sv-gap {
   font-size: 10px;
-  font-weight: 400;
+  font-weight: 600;
   color: var(--cp-danger);
-  margin-left: 4px;
+  margin: -2px 0 6px;
 }
 
 .sv-row {
@@ -489,5 +566,48 @@ onMounted(load)
   padding: 10px 12px;
   font-size: 12px;
   line-height: 1.9;
+}
+
+.sv-quota {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.sv-quota span {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border: 1px solid var(--cp-border);
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px 4px;
+}
+
+.sv-quota i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--cp-muted);
+}
+
+.sv-quota b {
+  font-size: 13px;
+  color: var(--cp-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.sv-quota b.short {
+  color: var(--cp-danger);
+}
+
+.sv-form-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--cp-muted);
+}
+
+.sv-form-hint.short {
+  color: var(--cp-danger);
 }
 </style>
